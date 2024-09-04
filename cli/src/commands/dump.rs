@@ -22,6 +22,7 @@ enum SupportedModules {
     Elf,
     Pe,
     Dotnet,
+    Eml,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -94,7 +95,7 @@ pub fn exec_dump(args: &ArgMatches) -> anyhow::Result<()> {
         stdin().read_to_end(&mut buffer)?
     };
 
-    let mut module_output = invoke_all(&buffer);
+    let mut module_output = invoke_all(&buffer, None);
 
     if let Some(modules) = requested_modules {
         // The user asked explicitly for one or more modules, clear out
