@@ -760,7 +760,7 @@ mod output_handler {
             output: &Sender<Message>,
         );
         /// Called when the last file has been scanned.
-        fn on_done(&self, _output: &Sender<Message>) {}
+        fn on_done(&self, _output: &Sender<Message>);
     }
 
     pub(super) struct TextOutputHandler {
@@ -922,6 +922,10 @@ mod output_handler {
                 }
             }
         }
+
+        fn on_done(&self, _output: &Sender<Message>) {
+            // Nothing to do here.
+        }
     }
 
     pub(super) struct NdJsonOutputHandler {
@@ -963,18 +967,95 @@ mod output_handler {
 
             output.send(Message::Info(line)).unwrap();
         }
+
+        fn on_done(&self, _output: &Sender<Message>) {
+            // Nothing to do here.
+        }
+    }
+
+    #[derive(serde::Serialize, Clone)]
+    struct StringJson {
+        identifier: String,
+        offset: usize,
+        r#match: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        xor_key: Option<u8>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        plaintext: Option<String>,
+    }
+
+    #[derive(serde::Serialize)]
+    struct HitJson {
+        rule: String,
+        file: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        meta: Option<HashMap<String, serde_json::Value>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tags: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        strings: Option<Vec<StringJson>>,
     }
 
     pub(super) struct JsonOutputHandler {
         output_options: OutputOptions,
-        matches: std::sync::Arc<Mutex<HashMap<String, Vec<JsonRule>>>>,
+        output_buffer: std::sync::Arc<std::sync::Mutex<Vec<HitJson>>>,
     }
 
     impl JsonOutputHandler {
         pub(super) fn new(output_options: OutputOptions) -> Self {
-            let matches = std::sync::Arc::new(Mutex::new(HashMap::new()));
-            Self { output_options, matches }
+            let output_buffer = Default::default();
+            Self { output_options, output_buffer }
         }
+    }
+
+    fn patterns_to_string_jsons(
+        patterns: Patterns<'_, '_>,
+        string_limit: usize,
+    ) -> Vec<StringJson> {
+        patterns
+            .flat_map(|pattern| {
+                let identifier = pattern.identifier();
+
+                pattern.matches().map(|pattern_match| {
+                    let match_range = pattern_match.range();
+                    let match_data = pattern_match.data();
+
+                    let more_bytes_message =
+                        match match_data.len().saturating_sub(string_limit) {
+                            0 => None,
+                            n => Some(format!(" ... {} more bytes", n)),
+                        };
+
+                    let string = match_data
+                        .iter()
+                        .take(string_limit)
+                        .flat_map(|char| char.escape_ascii())
+                        .map(|c| c as char)
+                        .chain(
+                            more_bytes_message
+                                .iter()
+                                .flat_map(|msg| msg.chars()),
+                        )
+                        .collect::<String>();
+
+                    StringJson {
+                        identifier: identifier.to_owned(),
+                        offset: match_range.start,
+                        r#match: string.clone(),
+                        xor_key: pattern_match.xor_key(),
+                        plaintext: pattern_match.xor_key().map(|xor_key| {
+                            match_data
+                                .iter()
+                                .take(string_limit)
+                                .map(|char| char ^ xor_key)
+                                .flat_map(|char| char.escape_ascii())
+                                .map(|char| char as char)
+                                .collect()
+                        }),
+                    }
+                })
+            })
+            .collect()
     }
 
     impl OutputHandler for JsonOutputHandler {
@@ -992,37 +1073,74 @@ mod output_handler {
                 .map(|s| s.to_string())
                 .unwrap_or_default();
 
-            let mut matches = self.matches.lock().unwrap();
+            // prepare the increment *outside* the critical section
+            let hits = scan_results
+                .filter(|rule| {
+                    self.output_options.only_tag.as_ref().map_or(
+                        true,
+                        |only_tag| {
+                            rule.tags().any(|tag| tag.identifier() == only_tag)
+                        },
+                    )
+                })
+                .map(|rule| {
+                    let meta = self.output_options.include_meta.then(|| {
+                        rule.metadata()
+                            .map(|(meta_key, meta_val)| {
+                                let meta_key = meta_key.to_owned();
+                                let meta_val = serde_json::to_value(meta_val)
+                                    .expect(
+                                    "Derived Serialize impl should never fail",
+                                );
 
-            matches
-                .entry(path)
-                .or_default()
-                .extend(rules_to_json(&self.output_options, scan_results));
+                                (meta_key, meta_val)
+                            })
+                            .collect::<HashMap<_, _>>()
+                    });
+
+                    let file = path.clone();
+
+                    let tags = self.output_options.include_tags.then(|| {
+                        rule.tags()
+                            .map(|t| t.identifier().to_string())
+                            .collect::<Vec<_>>()
+                    });
+
+                    let strings = self.output_options.include_strings.map(
+                        |strings_limit| {
+                            patterns_to_string_jsons(
+                                rule.patterns(),
+                                strings_limit,
+                            )
+                        },
+                    );
+
+                    HitJson {
+                        rule: rule.identifier().to_string(),
+                        meta,
+                        file,
+                        tags,
+                        strings,
+                    }
+                });
+
+            {
+                let mut lock = self.output_buffer.lock().unwrap();
+                lock.extend(hits);
+            }
         }
 
         fn on_done(&self, output: &Sender<Message>) {
-            let matches = self.matches.lock().unwrap();
-
-            let json = if self.output_options.count_only {
-                let json_output = matches
-                    .iter()
-                    .map(|(path, rules)| JsonCountOutput {
-                        path,
-                        count: rules.len(),
-                    })
-                    .collect::<Vec<_>>();
-
-                serde_json::to_string_pretty(&json_output).unwrap_or_default()
-            } else {
-                let json_output = matches
-                    .iter()
-                    .map(|(path, rules)| JsonOutput { path, rules })
-                    .collect::<Vec<_>>();
-
-                serde_json::to_string_pretty(&json_output).unwrap_or_default()
+            let json = {
+                let lock = self.output_buffer.lock().unwrap();
+                serde_json::to_string_pretty(&*lock)
+                    .expect("Derived Serialize impl should never fail")
             };
 
-            output.send(Message::Info(json)).unwrap();
+            match self.output_options.count_only {
+                true => todo!(),
+                false => output.send(Message::Info(json)).unwrap(),
+            }
         }
     }
 }
