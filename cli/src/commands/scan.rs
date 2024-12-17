@@ -984,7 +984,7 @@ mod output_handler {
         plaintext: Option<String>,
     }
 
-    #[derive(serde::Serialize)]
+    #[derive(serde::Serialize, Clone)]
     struct HitJson {
         rule: String,
         file: String,
@@ -994,6 +994,14 @@ mod output_handler {
         tags: Option<Vec<String>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         strings: Option<Vec<StringJson>>,
+    }
+
+    #[derive(serde::Serialize)]
+    struct OutputJson {
+        version: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        count: Option<usize>,
+        hits: Vec<HitJson>,
     }
 
     pub(super) struct JsonOutputHandler {
@@ -1131,16 +1139,19 @@ mod output_handler {
         }
 
         fn on_done(&self, output: &Sender<Message>) {
-            let json = {
-                let lock = self.output_buffer.lock().unwrap();
-                serde_json::to_string_pretty(&*lock)
-                    .expect("Derived Serialize impl should never fail")
+            let hits = {
+                let mut lock = self.output_buffer.lock().unwrap();
+                std::mem::take(&mut *lock)
             };
+            let version = env!("CARGO_PKG_VERSION").to_string();
+            let count = self.output_options.count_only.then_some(hits.len());
 
-            match self.output_options.count_only {
-                true => todo!(),
-                false => output.send(Message::Info(json)).unwrap(),
-            }
+            let output_json = OutputJson { hits, version, count };
+
+            let rendered_json = serde_json::to_string_pretty(&output_json)
+                .expect("Derived Serialize impl should never fail");
+
+            output.send(Message::Info(rendered_json)).unwrap();
         }
     }
 }
